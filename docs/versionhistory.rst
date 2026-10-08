@@ -9,6 +9,14 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
   across backends (asyncio returned immediately; Trio raised ``ValueError``) by
   raising ``ValueError`` on all backends
   (`#1306 <https://github.com/agronholm/anyio/issues/1306>`_; PR by @BetterAndBetterII)
+- Fixed the asyncio backend re-delivering a pending parent cancellation when a
+  shielded cancel scope exited with an exception (such as a cleanup failure in
+  ``TemporaryDirectory``). The cancellation, already handled or still in flight, was
+  triggered a second time at the next checkpoint while the exception propagated and
+  ended up replacing it, so cleanup and body exceptions were silently swallowed.
+  Shielded scopes whose body raised now leave the in-flight exception for the caller;
+  cancellation after a normal exit is delivered as before, matching Trio
+  (`#1304 <https://github.com/agronholm/anyio/pull/1304>`_)
 
 **4.15.1**
 

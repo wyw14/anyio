@@ -4,7 +4,7 @@ import os
 import pathlib
 import shutil
 import tempfile
-from typing import AnyStr
+from typing import Any, AnyStr
 from unittest.mock import patch
 
 import pytest
@@ -20,6 +20,9 @@ from anyio import (
     mkdtemp,
     mkstemp,
 )
+from anyio.lowlevel import checkpoint
+
+from .conftest import asyncio_params
 
 
 class TestTemporaryFile:
@@ -126,7 +129,36 @@ class TestSpooledTemporaryFile:
             assert bytes(buf) == b"hello"
 
 
+class CheckpointOnExit:
+    """A context manager whose cleanup performs a checkpoint, like many real ones."""
+
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> bool:
+        await checkpoint()
+        return False
+
+
 class TestTemporaryDirectory:
+    @staticmethod
+    def _make_cleanup_fail(tempdir: TemporaryDirectory) -> None:
+        """Make the wrapped stdlib directory's cleanup raise after removing it."""
+        original_cleanup = tempdir._tempdir.cleanup
+
+        def failing_cleanup() -> None:
+            # Remove the directory anyway, so the failure does not leave anything
+            # behind on disk
+            original_cleanup()
+            raise OSError("synthetic cleanup failure")
+
+        tempdir._tempdir.cleanup = failing_cleanup
+
     async def test_context_manager(self) -> None:
         async with TemporaryDirectory() as td:
             td_path = pathlib.Path(td)
@@ -176,6 +208,86 @@ class TestTemporaryDirectory:
                 outer_scope.cancel()
 
         assert not td_path.exists()
+
+    async def test_exit_with_cancellation_and_cleanup_error(self) -> None:
+        """
+        Cleanup failure must reach the caller even when the enclosing scope was
+        cancelled before the cleanup finished. The cancellation must not replace
+        (swallow) the cleanup exception.
+        """
+        tempdir = TemporaryDirectory()
+        with pytest.raises(OSError, match="synthetic cleanup failure"):
+            with CancelScope() as outer_scope:
+                async with tempdir as td:
+                    td_path = pathlib.Path(td)
+                    self._make_cleanup_fail(tempdir)
+                    outer_scope.cancel()
+
+        assert not td_path.exists()
+        assert not outer_scope.cancelled_caught
+
+    async def test_exit_with_body_error_and_cancel_and_cleanup_error(self) -> None:
+        """
+        A body exception, a pending parent cancellation and a cleanup failure at
+        the same time must leave the cleanup error for the caller, chained with
+        the body exception, rather than collapsing into a swallowed
+        cancellation.
+        """
+        tempdir = TemporaryDirectory()
+        with pytest.raises(OSError, match="synthetic cleanup failure") as exc_info:
+            with CancelScope() as outer_scope:
+                async with tempdir as td:
+                    td_path = pathlib.Path(td)
+                    self._make_cleanup_fail(tempdir)
+                    outer_scope.cancel()
+                    raise ValueError("synthetic body failure")
+
+        assert isinstance(exc_info.value.__context__, ValueError)
+        assert not td_path.exists()
+        assert not outer_scope.cancelled_caught
+
+    @pytest.mark.parametrize("anyio_backend", asyncio_params)
+    async def test_cleanup_error_not_cancelled_at_outer_checkpoint(self) -> None:
+        """
+        Regression test: when the cancelled body unwinds through another context
+        manager that checkpoints on exit, the pending parent cancellation used to
+        be delivered anew at that checkpoint while the cleanup error was
+        propagating, causing the enclosing cancel scope to swallow the cleanup
+        error together with the cancellation.
+        """
+        tempdir = TemporaryDirectory()
+        with pytest.raises(OSError, match="synthetic cleanup failure"):
+            with CancelScope() as outer_scope:
+                async with CheckpointOnExit():
+                    async with tempdir as td:
+                        td_path = pathlib.Path(td)
+                        self._make_cleanup_fail(tempdir)
+                        outer_scope.cancel()
+                        await checkpoint()  # cancellation is delivered to the body
+
+        assert not td_path.exists()
+        assert not outer_scope.cancelled_caught
+
+    @pytest.mark.parametrize("anyio_backend", asyncio_params)
+    async def test_body_error_not_cancelled_at_outer_checkpoint(self) -> None:
+        """
+        Same as above, but the body itself raised a non-cancellation exception.
+        It (and the cleanup error) must survive the checkpoint run while the
+        stack unwinds.
+        """
+        tempdir = TemporaryDirectory()
+        with pytest.raises(OSError, match="synthetic cleanup failure") as exc_info:
+            with CancelScope() as outer_scope:
+                async with CheckpointOnExit():
+                    async with tempdir as td:
+                        td_path = pathlib.Path(td)
+                        self._make_cleanup_fail(tempdir)
+                        outer_scope.cancel()
+                        raise ValueError("synthetic body failure")
+
+        assert isinstance(exc_info.value.__context__, ValueError)
+        assert not td_path.exists()
+        assert not outer_scope.cancelled_caught
 
 
 @pytest.mark.parametrize(

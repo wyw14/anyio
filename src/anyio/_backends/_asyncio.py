@@ -488,8 +488,15 @@ class CancelScope(BaseCancelScope):
             host_task_state.cancel_scope = self._parent_scope
 
             # Restart the cancellation effort in the closest visible, cancelled parent
-            # scope if necessary
-            self._restart_cancellation_in_parent()
+            # scope if necessary. When exiting a shielded scope whose body raised, do
+            # not (re)deliver a pending cancellation: the exception already in flight
+            # has to reach the caller instead of being clobbered by a freshly
+            # delivered CancelledError at the next checkpoint (and if that exception
+            # already is a CancelledError, the cancellation is propagating on its own
+            # and must not be delivered a second time). Cancellation that is still in
+            # effect after a normal exit is picked up here as before.
+            if exc_val is None or not self._shield:
+                self._restart_cancellation_in_parent()
 
             # We only swallow the exception iff it was an AnyIO CancelledError, either
             # directly as exc_val or inside an exception group and there are no cancelled
