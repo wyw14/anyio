@@ -18,7 +18,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import AbstractContextManager
-from contextvars import Context
+from contextvars import Context, copy_context
 from dataclasses import dataclass
 from functools import partial, wraps
 from io import IOBase
@@ -1201,6 +1201,22 @@ class TrioBackend(AsyncBackend):
         trio_token = cast("trio.lowlevel.TrioToken | None", token)
         try:
             return trio.from_thread.run_sync(func, *args, trio_token=trio_token)
+        except trio.RunFinishedError:
+            raise RunFinishedError from None
+
+    @classmethod
+    def run_sync_soon(
+        cls,
+        func: Callable[[Unpack[PosArgsT]], object],
+        args: tuple[Unpack[PosArgsT]],
+        token: object,
+    ) -> None:
+        trio_token = cast("trio.lowlevel.TrioToken", token)
+
+        # Snapshot the caller's context so the callable runs in an isolated copy
+        # of the context as it was at the time of this call
+        try:
+            trio_token.run_sync_soon(copy_context().run, func, *args)
         except trio.RunFinishedError:
             raise RunFinishedError from None
 

@@ -36,7 +36,7 @@ from ._core._eventloop import (
     threadlocals,
 )
 from ._core._eventloop import run as run_eventloop
-from ._core._exceptions import NoEventLoopError
+from ._core._exceptions import NoEventLoopError, RunFinishedError
 from ._core._synchronization import Event
 from ._core._tasks import CancelScope, create_task_group
 from .abc._tasks import TaskStatus
@@ -253,9 +253,14 @@ class BlockingPortal:
                 if event_loop_thread_id == get_ident():
                     scope.cancel("the future was cancelled")
                 elif event_loop_thread_id is not None:
-                    run_sync(
-                        scope.cancel, "the future was cancelled", token=self._token
-                    )
+                    try:
+                        self._token.backend_class.run_sync_soon(
+                            scope.cancel,
+                            ("the future was cancelled",),
+                            self._token.native_token,
+                        )
+                    except RunFinishedError:
+                        pass
 
         try:
             retval_or_awaitable = func(*args, **kwargs)
@@ -310,6 +315,39 @@ class BlockingPortal:
             token=self._token,
         )
 
+    def _spawn_task_from_event_loop(
+        self,
+        func: Callable[[Unpack[PosArgsT]], Awaitable[T_Retval] | T_Retval],
+        args: tuple[Unpack[PosArgsT]],
+        future: Future[T_Retval],
+        handle_holder: dict[str, Any],
+    ) -> None:
+        """
+        Spawn a new task in the portal's event loop on behalf of another event loop.
+
+        :param func: a callable
+        :param args: positional arguments to be passed to the callable
+        :param future: a future that will resolve to the return value of the callable,
+            or the exception raised during its execution
+        :param handle_holder: a dict in which the handle of the spawned task is
+            published, so the caller can cancel it
+        """
+
+        def spawn_task() -> None:
+            try:
+                handle = self._task_group.start_soon(
+                    self._call_func, func, args, {}, future
+                )
+            except BaseException as exc:
+                if not future.done():
+                    future.set_exception(exc)
+            else:
+                handle_holder["handle"] = handle
+
+        self._token.backend_class.run_sync_soon(
+            spawn_task, (), self._token.native_token
+        )
+
     @overload
     def call(
         self,
@@ -338,6 +376,84 @@ class BlockingPortal:
 
         """
         return cast(T_Retval, self.start_task_soon(func, *args).result())
+
+    @overload
+    async def call_async(
+        self,
+        func: Callable[[Unpack[PosArgsT]], Awaitable[T_Retval]],
+        *args: Unpack[PosArgsT],
+    ) -> T_Retval: ...
+
+    @overload
+    async def call_async(
+        self, func: Callable[[Unpack[PosArgsT]], T_Retval], *args: Unpack[PosArgsT]
+    ) -> T_Retval: ...
+
+    async def call_async(
+        self,
+        func: Callable[[Unpack[PosArgsT]], Awaitable[T_Retval] | T_Retval],
+        *args: Unpack[PosArgsT],
+    ) -> T_Retval:
+        """
+        Call the given function in the portal's event loop from another event loop.
+
+        The function, and any tasks it spawns, sees a copy of the calling task's
+        context taken when this method was invoked. Modifications to context
+        variables in the spawned task do not propagate back to the calling task or
+        any sibling tasks. If the callable returns an awaitable, it is awaited on.
+
+        Cancelling the calling task cancels the task running in the portal.
+
+        :param func: any callable
+        :return: the return value of the callable
+        :raises RuntimeError: if the portal is not running or if this method is
+            called from within the portal's event loop thread
+        :raises RunFinishedError: if the portal's event loop has already exited
+
+        .. versionadded:: 4.16.0
+        """
+        self._check_running()
+        source_token = current_token()
+        event = Event()
+        future: Future[T_Retval] = Future()
+
+        def notify_source(_: Future[T_Retval]) -> None:
+            try:
+                source_token.backend_class.run_sync_soon(
+                    event.set, (), source_token.native_token
+                )
+            except RunFinishedError:
+                pass
+
+        future.add_done_callback(notify_source)
+
+        # This dict is populated with the target task's handle once the task has
+        # been spawned in the portal's event loop
+        handle_holder: dict[str, Any] = {}
+        self._spawn_task_from_event_loop(func, args, future, handle_holder)
+        try:
+            await event.wait()
+        except BaseException:
+            # Propagate the cancellation to the task in the portal, if it has
+            # already been spawned. This callback is queued after the spawn
+            # callback, so the handle is guaranteed to be available by the time
+            # it runs (unless the portal's event loop exits first)
+            def cancel_target() -> None:
+                handle = handle_holder.get("handle")
+                if handle is not None:
+                    handle.cancel()
+
+            try:
+                self._token.backend_class.run_sync_soon(
+                    cancel_target, (), self._token.native_token
+                )
+            except RunFinishedError:
+                pass
+
+            future.cancel()
+            raise
+
+        return future.result()
 
     @overload
     def start_task_soon(

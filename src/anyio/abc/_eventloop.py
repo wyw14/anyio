@@ -236,6 +236,25 @@ class AsyncBackend(metaclass=ABCMeta):
 
     @classmethod
     @abstractmethod
+    def run_sync_soon(
+        cls,
+        func: Callable[[Unpack[PosArgsT]], object],
+        args: tuple[Unpack[PosArgsT]],
+        token: object,
+    ) -> None:
+        """
+        Schedule a synchronous callable to run in an event loop without waiting for
+        it to finish.
+
+        The callable runs in a copy of the calling thread's context taken at the
+        time of this call.
+
+        :raises RunFinishedError: if the event loop tied to ``token`` is no longer
+            running
+        """
+
+    @classmethod
+    @abstractmethod
     async def open_process(
         cls,
         command: StrOrBytesPath | Sequence[StrOrBytesPath],
